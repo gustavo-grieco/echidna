@@ -5,7 +5,7 @@ module Echidna.Campaign where
 
 import Control.Concurrent
 import Control.DeepSeq (force)
-import Control.Monad (replicateM, when, unless, void, forM_)
+import Control.Monad (replicateM, replicateM_, when, unless, void, forM_)
 import Control.Monad.Catch (MonadThrow(..))
 import Control.Monad.Random.Strict (MonadRandom, RandT, evalRandT)
 import Control.Monad.Reader (MonadReader, asks, liftIO, ask)
@@ -26,6 +26,9 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Time (LocalTime)
 import System.Random (mkStdGen)
+import List.Shuffle (shuffleIO)
+import Data.List.NonEmpty qualified as NEList
+
 
 import EVM (cheatCode)
 import EVM.ABI (getAbi, AbiType(AbiAddressType), AbiValue(AbiAddress))
@@ -37,7 +40,7 @@ import Echidna.Exec
 import Echidna.Mutator.Corpus
 import Echidna.Shrink (shrinkTest)
 import Echidna.Symbolic (forceAddr)
-import Echidna.SymExec (createSymTx)
+import Echidna.SymExec (createSymTx, verifyContract)
 import Echidna.Test
 import Echidna.Transaction
 import Echidna.Types (Gas)
@@ -48,6 +51,7 @@ import Echidna.Types.Config
 import Echidna.Types.Signature (FunctionName)
 import Echidna.Types.Test
 import Echidna.Types.Test qualified as Test
+import Echidna.Types.Random (rElem)
 import Echidna.Types.Tx (TxCall(..), Tx(..))
 import Echidna.Utility (getTimestamp)
 
@@ -110,19 +114,29 @@ runSymWorker
   -> Maybe Text -- ^ Specified contract name
   -> m (WorkerStopReason, WorkerState)
 runSymWorker callback vm dict workerId initialCorpus name = do
+  shuffleCorpus <- shuffleIO initialCorpus
   cfg <- asks (.cfg)
   let nworkers = getNFuzzWorkers cfg.campaignConf -- getNFuzzWorkers, NOT getNWorkers
   eventQueue <- asks (.eventQueue)
   chan <- liftIO $ dupChan eventQueue
+  dapp <- asks (.dapp)
 
-  flip runStateT initialState $
-    flip evalRandT (mkStdGen effectiveSeed) $ do -- unused but needed for callseq
-      lift callback
-      void $ replayCorpus vm initialCorpus
-      symexecTxs []
-      mapM_ (symexecTxs . snd) initialCorpus
-      listenerLoop listenerFunc chan nworkers
-      pure SymbolicDone
+  if (cfg.campaignConf.workers == Just 0) && (cfg.campaignConf.seqLen == 1) then do 
+    flip runStateT initialState $
+      flip evalRandT (mkStdGen effectiveSeed) $ do -- unused but needed for callseq
+        verifyContract name (Map.elems dapp.solcByName) vm
+        pure SymbolicDone
+  else
+    flip runStateT initialState $
+      flip evalRandT (mkStdGen effectiveSeed) $ do -- unused but needed for callseq
+        lift callback
+        listenerLoop listenerFunc chan nworkers
+        void $ replayCorpus vm initialCorpus
+        if null shuffleCorpus then 
+          replicateM_ 10 $ symexecTxs [] -- TODO: determine how many times to symexec here
+        else 
+          mapM_ (symexecTxs . snd) shuffleCorpus
+        pure SymbolicDone
 
   where
 
@@ -147,33 +161,30 @@ runSymWorker callback vm dict workerId initialCorpus name = do
     symexecTxs transactions
   listenerFunc _ = pure ()
 
-  symexecTxs txs = mapM_ symexecTx =<< txsToTxAndVms txs
+  symexecTxs txs = mapM_ symexecTx =<< txsToTxAndVmsSym txs
 
   -- | Turn a list of transactions into inputs for symexecTx:
-  -- (maybe txn to concolic execute on, vm to symexec on, list of txns we're on top of)
-  txsToTxAndVms txs = do
-    isConc <- asks (.cfg.campaignConf.symExecConcolic)
-    if isConc
-      then txsToTxAndVmsConc txs vm []
-      else txsToTxAndVmsSym txs
-
-  txsToTxAndVmsConc [] _ _ = pure []
-  txsToTxAndVmsConc (h:t) vm' txsBase = do
-    (_, vm'') <- execTx vm' h
-    rest <- txsToTxAndVmsConc t vm'' (txsBase <> [h])
-    pure $ case h of
-             (Tx { call = SolCall _ }) -> (Just h,vm',txsBase):rest
-             _ -> rest
-
+  -- (list of txns we're on top of)
+  txsToTxAndVmsSym [] = pure [(Nothing, vm, [])]
   txsToTxAndVmsSym txs = do
-    vm' <- foldlM (\vm' tx -> snd <$> execTx vm' tx) vm txs
-    pure [(Nothing,vm',txs)]
+    -- Discard the last tx, which should be the one increasing coverage
+    let (itxs, ltx) = (init txs, last txs)
+    ivm <- foldlM (\vm' tx -> snd <$> execTx vm' tx) vm itxs
+    -- Split the sequence randomly and select any next transaction
+    i <- if length txs == 1 then pure 0 else rElem $ NEList.fromList [1 .. length txs - 1]
+    let rtxs = take i txs
+    rvm <- foldlM (\vm' tx -> snd <$> execTx vm' tx) vm rtxs
+    cfg <- asks (.cfg)
+    let targets = cfg.campaignConf.symExecTargets
+    if isJust targets then
+      pure [(Nothing, rvm, rtxs)]
+    else 
+      pure [(Just ltx, ivm, txs), (Nothing, rvm, rtxs)]
 
   symexecTx (tx, vm', txsBase) = do
-    cfg <- asks (.cfg)
     dapp <- asks (.dapp)
     let compiledContracts = Map.elems dapp.solcByName
-    (threadId, symTxsChan) <- liftIO $ createSymTx cfg name compiledContracts tx vm'
+    (threadId, symTxsChan) <- createSymTx name compiledContracts tx vm'
 
     modify' (\ws -> ws { runningThreads = [threadId] })
     lift callback

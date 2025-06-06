@@ -1,145 +1,229 @@
 {-# OPTIONS_GHC -Wno-gadt-mono-local-binds #-}
 
-module Echidna.SymExec (createSymTx) where
+module Echidna.SymExec where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent.Async (mapConcurrently)
 import Control.Concurrent (ThreadId, forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forM)
-import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Reader (runReaderT)
+import Control.Monad.Catch (MonadThrow(..))
+import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.Reader (MonadReader, ask, asks, runReaderT, liftIO)
 import Data.ByteString.Lazy qualified as BS
-import Data.Foldable (fold)
 import Data.Function ((&))
-import Data.List (singleton)
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe, mapMaybe, isJust, fromJust)
+import Data.Maybe (fromMaybe, mapMaybe, fromJust)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding (encodeUtf8)
 import Data.Vector (toList, fromList)
-import Optics.Core ((.~), (%))
+import GHC.IORef (IORef, readIORef)
+import Optics.Core ((.~), (%), (%~))
+import EVM.ABI (abiKind, AbiKind(Dynamic), AbiValue(..), AbiType(..), Sig(..), decodeAbiValue)
+import EVM.Fetch qualified as Fetch
+import EVM (loadContract, resetState, forceLit)
+import EVM.Effects (defaultEnv, defaultConfig, Config(..), config, TTY)
+import EVM.Solidity (SolcContract(..), Method(..))
+import EVM.Solvers (withSolvers, SolverGroup)
+import EVM.SymExec (IterConfig(..), abstractVM, mkCalldata, LoopHeuristic (..), verifyInputs, VeriOpts(..), checkAssertions)
+import EVM.Types (abiKeccak, FunctionSelector, Addr, Frame(..), FrameState(..), VMType(..), EType(..), Expr(..), word256Bytes, Block(..), W256, SMTCex(..), ProofResult(..), Prop(..), Query(..))
+import qualified EVM.Types (VM(..), Env(..))
+import qualified EVM.Effects (Env(..))
+import Control.Monad.ST (stToIO, RealWorld)
+import Control.Monad.State.Strict (execState, runStateT)
+import List.Shuffle (shuffleIO)
+
 import Echidna.Solidity (chooseContract)
 import Echidna.Types (fromEVM)
 import Echidna.Types.Campaign (CampaignConf(..))
-import Echidna.Types.Config (EConfig(..))
+import Echidna.Types.Config (Env(..), EConfig(..))
+import Echidna.Types.World (World(..))
 import Echidna.Types.Solidity (SolConf(..))
-import EVM.ABI (AbiValue(..), AbiType(..), Sig(..), decodeAbiValue)
-import EVM.Expr (simplify)
-import EVM.Fetch qualified as Fetch
-import EVM.SMT (SMT2, assertProps)
-import EVM (loadContract, resetState)
-import EVM.Effects (defaultEnv, defaultConfig)
-import EVM.Solidity (SolcContract(..), Method(..))
-import EVM.Solvers (withSolvers, Solver(Z3), SolverGroup, checkSat)
-import EVM.SymExec (interpret, runExpr, abstractVM, mkCalldata, IterConfig(..), LoopHeuristic (Naive), flattenExpr, extractProps)
-import EVM.Types (Addr, VM(..), Frame(..), FrameState(..), VMType(..), Env(..), Expr(..), EType(..), Query(..), Prop(..), SMTCex(..), SMTResult, ProofResult(..), BranchCondition(..), W256, word256Bytes, word)
-import EVM.Traversals (mapExpr)
-import Control.Monad.ST (stToIO, RealWorld)
-import Control.Monad.State.Strict (execState, runStateT)
-import Echidna.Types.Tx (Tx(..), TxCall(..), maxGasPerBlock)
-
+import Echidna.Types.Tx (Tx(..), TxCall(..), maxGasPerBlock, maxBlockDelay, maxTimeDelay)
+import Echidna.Types.Cache (ContractCache, SlotCache)
 
 -- | Uses symbolic execution to find transactions which would increase coverage.
 -- Spawns a new thread; returns its thread ID as the first return value.
 -- The second return value is an MVar which is populated with transactions
 --   once the symbolic execution is finished.
 -- Also takes an optional Tx argument; this is used as the transaction
---   to follow during concolic execution. If none is provided, we do full
+--   to symbolize. If none is provided, we do full
 --   symbolic execution.
 --   The Tx argument, if present, must have a .call value of type SolCall.
-createSymTx :: EConfig -> Maybe Text -> [SolcContract] -> Maybe Tx -> VM Concrete RealWorld -> IO (ThreadId, MVar [Tx])
-createSymTx cfg name cs tx vm = do
+createSymTx :: (MonadIO m, MonadThrow m, MonadReader Env m) => Maybe Text -> [SolcContract] -> Maybe Tx -> EVM.Types.VM Concrete RealWorld -> m (ThreadId, MVar [Tx])
+createSymTx name cs tx vm = do
   mainContract <- chooseContract cs name
-  exploreContract cfg mainContract tx vm
+  exploreContract mainContract tx vm
 
-exploreContract :: EConfig -> SolcContract -> Maybe Tx -> VM Concrete RealWorld -> IO (ThreadId, MVar [Tx])
-exploreContract conf contract tx vm = do
+verifyContract :: (MonadIO m, MonadThrow m, MonadReader Env m) => Maybe Text -> [SolcContract] -> EVM.Types.VM Concrete RealWorld -> m (ThreadId, MVar [Tx])
+verifyContract name cs vm = do
+  mainContract <- chooseContract cs name
+  exploreAllMethods mainContract vm
+
+exploreAllMethods :: (MonadIO m, MonadThrow m, MonadReader Env m) => SolcContract -> EVM.Types.VM Concrete RealWorld -> m (ThreadId, MVar [Tx])
+exploreAllMethods contract vm = do
+  conf <- asks (.cfg)
+  env <- ask
+  contractCacheRef <- asks (.fetchContractCache)
+  slotCacheRef <- asks (.fetchSlotCache)  
   let
-    isConc = isJust tx
     allMethods = Map.elems contract.abiMap
-    filterMethod name method = method.name == name &&
-      case conf.campaignConf.symExecTargets of
-        Just ms -> name `elem` ms
-        _       -> True
-    concMethods (Tx { call = SolCall (methodName, _) }) = filter (filterMethod methodName) allMethods
-    concMethods _ = error "`exploreContract` should only be called with Nothing or Just Tx{call=SolCall _} for its tx argument"
-    methods = maybe allMethods concMethods tx
-    timeout = Just (fromIntegral conf.campaignConf.symExecTimeout)
-    maxIters = if isConc then Nothing else Just conf.campaignConf.symExecMaxIters
-    askSmtIters = if isConc then 0 else conf.campaignConf.symExecAskSMTIters
-    iterConfig = IterConfig { maxIter = maxIters, askSmtIters = askSmtIters, loopHeuristic = Naive }
-    rpcInfo = Nothing
-    defaultSender = fromJust $ fmap (.dst) tx <|> Set.lookupMin conf.solConf.sender <|> Just 0
+    filteredMethods = filter (filterTarget conf.campaignConf.symExecTargets env.world.assertSigs Nothing) allMethods
+    methods = filteredMethods
+    timeoutSMT = Just (fromIntegral conf.campaignConf.symExecTimeout)
+    maxIters = Just conf.campaignConf.symExecMaxIters
+    maxExplore = Just (fromIntegral conf.campaignConf.symExecMaxExplore)
+    askSmtIters = conf.campaignConf.symExecAskSMTIters
+    rpcInfo = rpcFetcher conf.rpcUrl (fromIntegral <$> conf.rpcBlock)
+    defaultSender = fromJust $ Set.lookupMin conf.solConf.sender <|> Just 0
 
-  threadIdChan <- newEmptyMVar
-  doneChan <- newEmptyMVar
-  resultChan <- newEmptyMVar
+  threadIdChan <- liftIO newEmptyMVar
+  doneChan <- liftIO newEmptyMVar
+  resultChan <- liftIO newEmptyMVar
+  let iterConfig = IterConfig { maxIter = maxIters, askSmtIters = askSmtIters, loopHeuristic = Naive}
+  let veriOpts = VeriOpts {iterConf = iterConfig, simp = True, rpcInfo = rpcInfo}
+  let runtimeEnv = defaultEnv { config = defaultConfig { maxWidth = 5, maxDepth = maxExplore, maxBufSize = 12, promiseNoReent = True, debug = True, dumpQueries = False, numCexFuzz = 100 } }
 
-  flip runReaderT defaultEnv $ withSolvers Z3 (fromIntegral conf.campaignConf.symExecNSolvers) 1 timeout $ \solvers -> do
-    threadId <- liftIO $ forkIO $ flip runReaderT defaultEnv $ do
-      res <- forM methods $ \method -> do
-        let
-          fetcher = concOrSymFetcher tx solvers rpcInfo
-          dst = conf.solConf.contractAddr
-        calldata@(cd, constraints) <- mkCalldata (Just (Sig method.methodSignature (snd <$> method.inputs))) []
-        vmSym <- liftIO $ stToIO $ abstractVM calldata contract.runtimeCode Nothing False
-        vmReset <- liftIO $ snd <$> runStateT (fromEVM resetState) vm
-        let vm' = vmReset & execState (loadContract (LitAddr dst))
-                          & vmMakeSymbolic
-                          & #constraints .~ constraints
-                          & #state % #callvalue .~ TxValue
-                          & #state % #caller .~ SymAddr "caller"
-                          & #state % #calldata .~ cd
-                          & #env % #contracts .~ Map.union vmSym.env.contracts vm.env.contracts
-        -- TODO we might want to switch vm's state.baseState value to to AbstractBase eventually.
-        -- Doing so might mess up concolic execution.
-        exprInter <- interpret fetcher iterConfig vm' runExpr
-        models <- liftIO $ mapConcurrently (checkSat solvers) $ manipulateExprInter isConc exprInter
-        pure $ mapMaybe (modelToTx dst method conf.solConf.sender defaultSender) models
+  liftIO $ flip runReaderT runtimeEnv $ withSolvers conf.campaignConf.symExecSMTSolver (fromIntegral conf.campaignConf.symExecNSolvers) 1 timeoutSMT $ \solvers -> do
+    threadId <- liftIO $ forkIO $ flip runReaderT runtimeEnv $ do
+      shuffleMethods <- shuffleIO methods
+      res <- forM shuffleMethods $ \method -> exploreMethod method contract vm defaultSender conf veriOpts solvers rpcInfo contractCacheRef slotCacheRef
       liftIO $ putMVar resultChan $ concat res
       liftIO $ putMVar doneChan ()
     liftIO $ putMVar threadIdChan threadId
     liftIO $ takeMVar doneChan
 
-  threadId <- takeMVar threadIdChan
+  threadId <- liftIO $ takeMVar threadIdChan
   pure (threadId, resultChan)
 
--- | Turn the expression returned by `interpret` into into SMT2 values to feed into the solver
-manipulateExprInter :: Bool -> Expr End -> [Either String SMT2]
-manipulateExprInter isConc = map (assertProps defaultConfig) . middleStep . map (extractProps . simplify) . flattenExpr . simplify where
-  middleStep = if isConc then middleStepConc else id
-  middleStepConc = map singleton . concatMap (go (PBool True))
-  go :: Prop -> [Prop] -> [Prop]
-  go _ [] = []
-  go acc (h:t) = (PNeg h `PAnd` acc) : go (h `PAnd` acc) t
+
+suitableForSymExec :: Method -> Bool
+suitableForSymExec m = not $ null m.inputs 
+  && null (filter (\(_, t) -> abiKind t == Dynamic) m.inputs) 
+  && not (T.isInfixOf "_no_symexec" m.name)
+
+-- | Filters methods based on the campaign configuration.
+-- If symExecTargets is Just, it filters methods by their name.
+-- If symExecTargets is Nothing, it filters methods by their signature and checks if they are suitable for symbolic execution.
+-- If the list of assertSigs is empty, it does not filter by signature (to workaround a potential bug in Slither).
+filterTarget :: Maybe [Text] -> [FunctionSelector] -> Maybe Tx -> Method -> Bool
+filterTarget symExecTargets assertSigs tx method =
+  case (symExecTargets, tx) of
+    (Just ms, _)                                       -> method.name `elem` ms
+    (_,  Just (Tx { call = SolCall (methodName, _) })) -> (assertSigs == [] || methodSig `elem` assertSigs) && method.name == methodName && suitableForSymExec method
+    _                                                  -> (assertSigs == [] || methodSig `elem` assertSigs) && suitableForSymExec method
+ where methodSig = abiKeccak $ encodeUtf8 method.methodSignature
+
+exploreContract :: (MonadIO m, MonadThrow m, MonadReader Env m) => SolcContract -> Maybe Tx -> EVM.Types.VM Concrete RealWorld -> m (ThreadId, MVar[Tx])
+exploreContract contract tx vm = do
+  conf <- asks (.cfg)
+  env <- ask
+  contractCacheRef <- asks (.fetchContractCache)
+  slotCacheRef <- asks (.fetchSlotCache)  
+  let
+    allMethods = Map.elems contract.abiMap
+    filteredMethods = filter (filterTarget conf.campaignConf.symExecTargets env.world.assertSigs tx) allMethods
+    methods = filteredMethods
+    timeoutSMT = Just (fromIntegral conf.campaignConf.symExecTimeout)
+    maxIters = Just conf.campaignConf.symExecMaxIters
+    maxExplore = Just (fromIntegral conf.campaignConf.symExecMaxExplore)
+    askSmtIters = conf.campaignConf.symExecAskSMTIters
+    rpcInfo = rpcFetcher conf.rpcUrl (fromIntegral <$> conf.rpcBlock)
+    defaultSender = fromJust $ fmap (.dst) tx <|> Set.lookupMin conf.solConf.sender <|> Just 0
+
+  threadIdChan <- liftIO newEmptyMVar
+  doneChan <- liftIO newEmptyMVar
+  resultChan <- liftIO newEmptyMVar
+  let iterConfig = IterConfig { maxIter = maxIters, askSmtIters = askSmtIters, loopHeuristic = Naive}
+  let veriOpts = VeriOpts {iterConf = iterConfig, simp = True, rpcInfo = rpcInfo}
+  let runtimeEnv = defaultEnv { config = defaultConfig { maxWidth = 5, maxDepth = maxExplore, maxBufSize = 12, promiseNoReent = True, debug = True, dumpQueries = False, numCexFuzz = 100 } }
+
+  liftIO $ flip runReaderT runtimeEnv $ withSolvers conf.campaignConf.symExecSMTSolver (fromIntegral conf.campaignConf.symExecNSolvers) 1 timeoutSMT $ \solvers -> do
+    threadId <- liftIO $ forkIO $ flip runReaderT runtimeEnv $ do
+      shuffleMethods <- shuffleIO methods
+      -- For now, we will be exploring a single method at a time.
+      -- In some cases, this methods list will have only one method, but in other cases, it will have several methods.
+      -- This is to improve the user experience, as it will produce results more often, instead having to wait for exploring several
+      res <- forM (take 1 shuffleMethods) $ \method -> exploreMethod method contract vm defaultSender conf veriOpts solvers rpcInfo contractCacheRef slotCacheRef
+      liftIO $ putMVar resultChan $ concat res
+      --liftIO $ print "done"
+      liftIO $ putMVar doneChan ()
+    liftIO $ putMVar threadIdChan threadId
+    liftIO $ takeMVar doneChan
+
+  threadId <- liftIO $ takeMVar threadIdChan
+  pure (threadId, resultChan)
+
+--exploreMethod :: (MonadIO m, ReadConfig m, TTY m) =>
+--  Method -> SolcContract -> EVM.Types.VM Concrete RealWorld -> Addr -> EConfig -> VeriOpts -> SolverGroup -> Fetch.RpcInfo -> IORef ContractCache -> IORef SlotCache -> m [Tx]
+
+exploreMethod method contract vm defaultSender conf veriOpts solvers rpcInfo contractCacheRef slotCacheRef = do
+  liftIO $ putStrLn ("Exploring: " ++ T.unpack method.name)
+  calldataSym@(cd, constraints) <- mkCalldata (Just (Sig method.methodSignature (snd <$> method.inputs))) []
+  let
+    fetcher = cachedOracle contractCacheRef slotCacheRef solvers rpcInfo
+    dst = conf.solConf.contractAddr
+    vmSym = abstractVM calldataSym contract.runtimeCode Nothing False
+  vmSym' <- liftIO $ stToIO vmSym
+  vmReset <- liftIO $ snd <$> runStateT (fromEVM resetState) vm
+  let vm' = vmReset & execState (loadContract (LitAddr dst))
+                    & vmMakeSymbolic conf.txConf.maxTimeDelay conf.txConf.maxBlockDelay
+                    & #constraints %~ (++ constraints ++ (senderConstraints conf.solConf.sender))
+                    & #state % #callvalue .~ TxValue
+                    & #state % #caller .~ SymAddr "caller"
+                    & #state % #calldata .~ cd
+                    & #env % #contracts .~ (Map.union vmSym'.env.contracts vm.env.contracts)
+  -- TODO we might want to switch vm's state.baseState value to to AbstractBase eventually.
+  -- Doing so might mess up concolic execution.
+  (_, models) <- verifyInputs solvers veriOpts fetcher vm' (Just $ checkAssertions [0x1])
+  let results = map fst models
+  liftIO $ mapM_ print results
+  let txs = mapMaybe (modelToTx dst vm.block.timestamp vm.block.number method conf.solConf.sender defaultSender) results
+  return txs
 
 -- | Sets result to Nothing, and sets gas to ()
-vmMakeSymbolic :: VM Concrete s -> VM Symbolic s
-vmMakeSymbolic vm
-  = VM
+vmMakeSymbolic :: W256 -> W256 -> EVM.Types.VM Concrete s -> EVM.Types.VM Symbolic s
+vmMakeSymbolic maxTimestampDiff maxNumberDiff vm
+  = EVM.Types.VM
   { result         = Nothing
   , state          = frameStateMakeSymbolic vm.state
   , frames         = map frameMakeSymbolic vm.frames
   , env            = vm.env
-  , block          = vm.block
+  , block          = blockMakeSymbolic vm.block
   , tx             = vm.tx
   , logs           = vm.logs
   , traces         = vm.traces
   , cache          = vm.cache
   , burned         = ()
   , iterations     = vm.iterations
-  , constraints    = vm.constraints
+  , constraints    = addBlockConstraints maxTimestampDiff maxNumberDiff vm.block vm.constraints
   , config         = vm.config
   , forks          = vm.forks
   , currentFork    = vm.currentFork
   , labels         = vm.labels
   , osEnv          = vm.osEnv
   , freshVar       = vm.freshVar
-  , exploreDepth   = vm.exploreDepth
+  , exploreDepth   = 0
   }
+
+blockMakeSymbolic :: Block -> Block
+blockMakeSymbolic b
+  = b {
+      timestamp = Var "symbolic_block_timestamp"
+    , number = Var "symbolic_block_number"
+  }
+
+addBlockConstraints :: W256 -> W256 -> Block -> [Prop] -> [Prop]
+addBlockConstraints maxTimestampDiff maxNumberDiff block cs =
+  cs ++ [
+    PGT (Var "symbolic_block_timestamp") (block.timestamp), PLT (Sub (Var "symbolic_block_timestamp") (block.timestamp)) $ Lit maxTimestampDiff,
+    PGT (Var "symbolic_block_number") (block.number), PLT (Sub (Var "symbolic_block_number") (block.number)) $ Lit maxNumberDiff
+  ]
+
+senderConstraints :: Set Addr -> [Prop]
+senderConstraints as = [foldr (\a b -> POr b (PEq (SymAddr "caller") (LitAddr a))) (PBool False) $ Set.toList as]
 
 frameStateMakeSymbolic :: FrameState Concrete s -> FrameState Symbolic s
 frameStateMakeSymbolic fs
@@ -164,8 +248,8 @@ frameStateMakeSymbolic fs
 frameMakeSymbolic :: Frame Concrete s -> Frame Symbolic s
 frameMakeSymbolic fr = Frame { context = fr.context, state = frameStateMakeSymbolic fr.state }
 
-modelToTx :: Addr -> Method -> Set Addr -> Addr -> SMTResult -> Maybe Tx
-modelToTx dst method senders fallbackSender result =
+modelToTx :: Addr -> Expr EWord -> Expr EWord -> Method -> Set Addr -> Addr -> ProofResult SMTCex String -> Maybe Tx
+modelToTx dst oldTimestamp oldNumber method senders fallbackSender result =
   case result of
     Cex cex ->
       let
@@ -195,10 +279,15 @@ modelToTx dst method senders fallbackSender result =
 
         grabTupleArg memberTypes name = AbiTuple $ fromList [grabArg t $ name <> "-t-" <> T.pack (show n) | (n, t) <- zip ([0..] :: [Int]) (toList memberTypes)]
 
-        src_ = fromMaybe 0 $ Map.lookup (SymAddr "sender") cex.addrs
+        src_ = fromMaybe 0 $ Map.lookup (SymAddr "caller") cex.addrs
         src = if Set.member src_ senders then src_ else fallbackSender
-
         value = fromMaybe 0 $ Map.lookup TxValue cex.txContext
+
+        newTimestamp = fromMaybe 0 $ Map.lookup (Var "symbolic_block_timestamp") cex.vars
+        diffTimestamp = if newTimestamp == 0 then 0 else newTimestamp - forceLit oldTimestamp
+
+        newNumber = fromMaybe 0 $ Map.lookup (Var "symbolic_block_number") cex.vars
+        diffNumber = if newNumber == 0 then 0 else newNumber - forceLit oldNumber
 
       in Just Tx
         { call = SolCall (method.name, args)
@@ -207,53 +296,31 @@ modelToTx dst method senders fallbackSender result =
         , gasprice = 0
         , gas = maxGasPerBlock
         , value = value
-        , delay = (0, 0)
+        , delay = (diffTimestamp, diffNumber)
         }
 
     _ -> Nothing
 
--- | Symbolic variable -> concrete value mapping used during concolic execution.
--- The third member in the tuple is the transaction value.
-type Substs = ([(Text, W256)], [(Text, Addr)], W256)
 
--- | Mirrors hevm's `symAbiArg` function; whenever that changes, we need to change this too
-genSubsts :: Tx -> Substs
-genSubsts (Tx { call = SolCall (_, abiVals), src, value }) = addOnFinalValues $ fold $ zipWith genVal abiVals (T.pack . ("arg" <>) . show <$> ([1..] :: [Int])) where
-  addOnFinalValues (a, b) = (a, ("sender", src):b, value)
-  genVal (AbiUInt _ i) name = ([(name, fromIntegral i)], [])
-  genVal (AbiInt _ i) name = ([(name, fromIntegral i)], [])
-  genVal (AbiBool b) name = ([(name, if b then 1 else 0)], [])
-  genVal (AbiAddress addr) name = ([], [(name, addr)])
-  genVal (AbiBytes n b) name | n > 0 && n <= 32 = ([(name, word b)], [])
-  genVal (AbiArray _ _ vals) name = fold $ zipWith genVal (toList vals) [name <> "-a-" <> T.pack (show n) | n <- [0..] :: [Int]]
-  genVal (AbiTuple vals) name = fold $ zipWith genVal (toList vals) [name <> "-t-" <> T.pack (show n) | n <- [0..] :: [Int]]
-  genVal _ _ = error "`genSubsts` is not implemented for all API types, mirroring hevm's `symAbiArg` function"
-genSubsts _ = error "`genSubsts` should only be called with a `SolCall` transaction argument"
+cachedOracle :: IORef ContractCache -> IORef SlotCache -> SolverGroup -> Fetch.RpcInfo -> Fetch.Fetcher t m s
+cachedOracle contractCacheRef slotCacheRef solvers info q = do
+  case q of
+    PleaseFetchContract addr _ continue -> do
+      cache <- liftIO $ readIORef contractCacheRef
+      case Map.lookup addr cache of
+          Just (Just contract) -> pure $ continue contract
+          _                    -> oracle q
+    PleaseFetchSlot addr slot continue -> do
+      cache <- liftIO $ readIORef slotCacheRef
+      case Map.lookup addr cache >>= Map.lookup slot of
+        Just (Just value) -> pure $ continue value
+        _                 -> oracle q
+    _ -> oracle q
 
--- | Apply substitutions into an expression
-substExpr :: Substs -> Expr a -> Expr a
-substExpr (sw, sa, val) = mapExpr go where
-  go v@(Var t) = maybe v Lit (lookup t sw)
-  go v@(SymAddr t) = maybe v LitAddr (lookup t sa)
-  go TxValue = Lit val
-  go e = e
+  where oracle = Fetch.oracle solvers info
 
--- | Fetcher used during concolic execution.
--- This is the most important function for concolic execution;
--- it determines what branch `interpret` should take.
--- We ensure that this fetcher is always used by setting askSMTIter to 0.
--- We determine what branch to take by substituting concrete values into
--- the provided `Prop`, and then simplifying.
--- We fall back on `Fetch.oracle`.
-concFetcher :: Substs -> SolverGroup -> Fetch.RpcInfo -> Fetch.Fetcher t m s
-concFetcher substs s r (PleaseAskSMT branchcondition pathconditions continue) =
-  case simplify (substExpr substs branchcondition) of
-    Lit n -> pure (continue (Case (n/=0)))
-    simplifiedExpr -> Fetch.oracle s r (PleaseAskSMT simplifiedExpr pathconditions continue)
-concFetcher _ s r q = Fetch.oracle s r q
+rpcFetcher :: Functor f =>
+  f a -> Maybe W256 -> f (Fetch.BlockNumber, a)
 
--- | Depending on whether we're doing concolic or full symbolic execution,
--- choose a fetcher to be used in `interpret` (either `concFetcher` or `Fetch.oracle`).
-concOrSymFetcher :: Maybe Tx -> SolverGroup -> Fetch.RpcInfo -> Fetch.Fetcher t m s
-concOrSymFetcher (Just c) = concFetcher $ genSubsts c
-concOrSymFetcher Nothing = Fetch.oracle
+rpcFetcher rpc block = (,) block' <$> rpc
+  where block' = maybe Fetch.Latest Fetch.BlockNumber block

@@ -241,7 +241,7 @@ execTx
   => VM Concrete RealWorld
   -> Tx
   -> m ((VMResult Concrete RealWorld, Gas), VM Concrete RealWorld)
-execTx vm tx = runStateT (execTxWith (fromEVM (exec defaultConfig)) tx) vm
+execTx vm tx = runStateT (execTxWith (fromEVM $ exec defaultConfig) tx) vm
 
 -- | A type alias for the context we carry while executing instructions
 type CoverageContext = (Bool, Maybe (VMut.IOVector CoverageInfo, Int))
