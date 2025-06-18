@@ -25,7 +25,7 @@ import EVM.Types hiding (Env, VMOpts(timestamp, gasprice))
 import Echidna.ABI
 import Echidna.Orphans.JSON ()
 import Echidna.SourceMapping (lookupUsingCodehash)
-import Echidna.Symbolic (forceWord, forceAddr)
+import Echidna.SymExec.Symbolic (forceWord, forceAddr)
 import Echidna.Types (fromEVM)
 import Echidna.Types.Config (Env(..), EConfig(..))
 import Echidna.Types.Random
@@ -155,6 +155,13 @@ mutateTx tx@Tx{call = SolCall c} = do
         skip _ = pure tx
 mutateTx tx = pure tx
 
+regenTx :: MonadRandom m => Tx -> m Tx
+regenTx tx@Tx{call = SolCall c} = do
+  mutate c
+  where mutate z = mutateAllAbiCall z >>= \c' -> pure tx { call = SolCall c' }
+
+regenTx tx = pure tx
+
 -- | Given a 'Transaction', set up some 'VM' so it can be executed. Effectively, this just brings
 -- 'Transaction's \"on-chain\".
 setupTx :: (MonadIO m, MonadState (VM Concrete RealWorld) m) => Tx -> m ()
@@ -198,4 +205,4 @@ setupTx tx@Tx{call} = fromEVM $ do
 advanceBlock :: Block -> (W256, W256) -> Block
 advanceBlock blk (t,b) =
   blk { timestamp = Lit (forceWord blk.timestamp + t)
-      , number = Lit (forceWord blk.number + b) }
+      , number = Lit $ forceWord blk.number + b }
