@@ -58,6 +58,8 @@ jobs:
 
       - name: Build dynamic echidna
         run: |
+          nix-shell -p nix-info --run "nix-info -m"
+          false
           nix build .#echidna
 
       - name: Build redistributable echidna
