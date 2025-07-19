@@ -10,6 +10,7 @@ module Common
   , solnFor
   , solved
   , passed
+  , verified
   , solvedLen
   , solvedWith
   , solvedWithout
@@ -39,6 +40,9 @@ import Data.SemVer (Version, version, fromText)
 import Data.Text (Text, pack)
 import System.Process (readProcess)
 
+import EVM.Solidity (Contracts(..), BuildOutput(..), SolcContract(..))
+import EVM.Types hiding (Env, Gas)
+
 import Echidna (mkEnv, prepareContract)
 import Echidna.Config (parseConfig, defaultConfig)
 import Echidna.Campaign (runWorker)
@@ -51,10 +55,8 @@ import Echidna.Types.Signature (ContractName)
 import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Test
 import Echidna.Types.Tx (Tx(..), TxCall(..))
+import Echidna.Types.Worker (WorkerType(..))
 import Echidna.Types.World (World(..))
-
-import EVM.Solidity (Contracts(..), BuildOutput(..), SolcContract(..))
-import EVM.Types hiding (Env, Gas)
 
 testConfig :: EConfig
 testConfig = defaultConfig & overrideQuiet
@@ -154,7 +156,7 @@ loadSolTests cfg buildOutput name = do
       (Contracts contractMap) = buildOutput.contracts
       contracts = Map.elems contractMap
       eventMap = Map.unions $ map (.eventMap) contracts
-      world = World solConf.sender mempty Nothing [] eventMap
+      world = World solConf.sender mempty Nothing [] [] eventMap
   mainContract <- selectMainContract solConf name contracts
   echidnaTests <- mkTests solConf mainContract
   env <- mkEnv cfg buildOutput echidnaTests world Nothing
@@ -218,6 +220,15 @@ passed n (env, _) = do
     Just t | isOpen t   -> True
     Nothing             -> error ("no test was found with name: " ++ show n)
     _                   -> False
+
+verified :: Text -> (Env, WorkerState) -> IO Bool
+verified n (env, _) = do
+  tests <- traverse readIORef env.testRefs
+  pure $ case getResult n tests of
+    Just t | isVerified t -> True
+    Just t | isOpen t     -> True
+    Nothing               -> error ("no test was found with name: " ++ show n)
+    _                     -> False
 
 solvedLen :: Int -> Text -> (Env, WorkerState) -> IO Bool
 solvedLen i t final = (== Just i) . fmap length <$> solnFor t final
